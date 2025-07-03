@@ -2,283 +2,127 @@ import 'dart:async';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:workmanager/workmanager.dart';
-import 'dart:developer' as developer;
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:permission_handler/permission_handler.dart';     // ← for POST_NOTIFICATIONS
 
+// ───────────────────────────────────────────────────────────
+//  Globals
+// ───────────────────────────────────────────────────────────
+const fetchBackground = 'fetchBackground';
+final FlutterLocalNotificationsPlugin notifications =
+    FlutterLocalNotificationsPlugin();
 
-
-const task = "getLocation";
-
-@pragma('vm:entry-point') // required for background isolate
+// ───────────────────────────────────────────────────────────
+//  Background‑isolate entry point
+// ───────────────────────────────────────────────────────────
+@pragma('vm:entry-point')                                   // keep after obfuscation
 void callbackDispatcher() {
   WidgetsFlutterBinding.ensureInitialized();
-  DartPluginRegistrant.ensureInitialized(); 
+  DartPluginRegistrant.ensureInitialized();                 // 🔑 registers plugins
 
-  Workmanager().executeTask((taskName, inputData) async{
-    switch (taskName) {
-      case "getLocation":
-        try {
-          final position = await Geolocator.getCurrentPosition(
-            locationSettings: LocationSettings(
-              accuracy: LocationAccuracy.high,
-              timeLimit: Duration(seconds: 15),
-            ),
-          );
-          developer.log("lat: ${position.latitude}, long: ${position.longitude}");
-
-          FlutterBackgroundService().invoke("updateNotification", {
-            "latitude": position.latitude.toString(),
-            "longitude": position.longitude.toString(),
-          });
-        }catch(e, stack){
-          developer.log("Error getting location: $e", stackTrace: stack);
-        }
-        break;
+  Workmanager().executeTask((task, inputData) async {
+    if (task == fetchBackground) {
+      try {
+        final pos = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: Duration(seconds: 15),
+          ),
+        );
+        await _showLocationNotification(pos);
+      } catch (e, s) {
+        debugPrint('BG error: $e\n$s');
+      }
     }
     return Future.value(true);
   });
 }
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  
-  await Workmanager().initialize(callbackDispatcher, isInDebugMode: true);
-
-  await FlutterBackgroundService().configure(
-    androidConfiguration: AndroidConfiguration(
-      onStart: onStart,
-      isForegroundMode: true,
-      autoStart: true,
-      notificationChannelId: 'my_foreground',
-      initialNotificationTitle: 'Tracking',
-      initialNotificationContent: 'Initializing...',
-    ),
-    iosConfiguration: IosConfiguration(),
+// ───────────────────────────────────────────────────────────
+//  Notification helper
+// ───────────────────────────────────────────────────────────
+Future<void> _showLocationNotification(Position pos) async {
+  const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+    'location_bg',                // channel ID
+    'Location Background',        // channel name
+    channelDescription: 'Shows location fetched in background',
+    importance: Importance.max,
+    priority: Priority.high,
+    playSound: false,
   );
 
-  // await initializeService();
+  const NotificationDetails details = NotificationDetails(android: androidDetails);
+
+  await notifications.show(
+    0,
+    'Location fetched',
+    'Lat: ${pos.latitude}, Lon: ${pos.longitude}',
+    details,
+  );
+}
+
+// ───────────────────────────────────────────────────────────
+//  App entry point
+// ───────────────────────────────────────────────────────────
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialise local‑notifications plugin (works in both isolates)
+  const AndroidInitializationSettings initAndroid =
+      AndroidInitializationSettings('@mipmap/ic_launcher');
+  const InitializationSettings initSettings =
+      InitializationSettings(android: initAndroid);
+  await notifications.initialize(initSettings);
+
+  // Request runtime permissions (location + notifications on Android 13+)
+  await _requestPermissions();
+
+  // Initialise & schedule Workmanager
+  await Workmanager().initialize(callbackDispatcher, isInDebugMode: false);
+
+  await Workmanager().registerPeriodicTask(
+    'bgLocationTask',
+    fetchBackground,
+    frequency: const Duration(minutes: 15), // Android min interval
+    constraints: Constraints(networkType: NetworkType.not_required),
+    existingWorkPolicy: ExistingWorkPolicy.keep,
+  );
+
   runApp(const MyApp());
 }
 
-@pragma('vm:entry-point')
-void onStart(ServiceInstance service) async {
-  DartPluginRegistrant.ensureInitialized();
+Future<void> _requestPermissions() async {
+  // Location
+  var locPermission = await Geolocator.checkPermission();
+  if (locPermission == LocationPermission.denied ||
+      locPermission == LocationPermission.deniedForever) {
+    locPermission = await Geolocator.requestPermission();
+  }
+  if (locPermission == LocationPermission.deniedForever) return;
 
-  service.on("updateNotification").listen((event) {
-    final latitude = event?['latitude'] ?? '';
-    final longitude = event?['longitude'] ?? '';
+  // Android 13+ notifications
+  if (await Permission.notification.isDenied) {
+    await Permission.notification.request();
+  }
 
-    if (service is AndroidServiceInstance) {
-      service.setForegroundNotificationInfo(
-        title: "Live Location",
-        content: "Lat: $latitude, Long: $longitude",
-      );
-    }
-  });
-
-  service.on("stopService").listen((event) {
-    service.stopSelf();
-  });
+  if (!await Geolocator.isLocationServiceEnabled()) {
+    await Geolocator.openLocationSettings();
+  }
 }
 
-// Future<void> initializeService() async {
-//   final service = FlutterBackgroundService();
-
-//   await service.configure(
-//     androidConfiguration: AndroidConfiguration(
-//       onStart: onStart,
-//       autoStartOnBoot: true,
-//       autoStart: true,
-//       isForegroundMode: true,
-//     ),
-//     iosConfiguration: IosConfiguration(),
-//   );
-
-//   await service.startService();
-// }
-
-// @pragma('vm:entry-point')
-// void onStart(ServiceInstance service) async {
-//   bool isTracking = true;
-//   SharedPreferences prefs = await DataStorage.getInstace();
-
-//   List<String> locationList = prefs.getStringList('location_history') ?? [];
-
-//   // Required for accessing platform channels in background isolate
-//   WidgetsFlutterBinding.ensureInitialized();
-
-//   final timer = Timer.periodic(const Duration(seconds: 60), (timer) async {
-//     if (!isTracking) return;
-
-//     if (service is AndroidServiceInstance) {
-//       if (await service.isForegroundService()) {
-//         // 🔍 Get current location
-//         LocationPermission permission = await Geolocator.checkPermission();
-//         if (permission == LocationPermission.whileInUse ||
-//             permission == LocationPermission.always) {
-//           // final position = await Geolocator.getCurrentPosition();
-//           try {
-//             final position = await Geolocator.getCurrentPosition(
-//               desiredAccuracy: LocationAccuracy.low,
-//             );
-
-//             final pos = "Lat: ${position.latitude}, Lng: ${position.longitude}";
-//             locationList.add(pos);
-
-//             // Save updated list
-//             await prefs.setStringList('location_history', locationList);
-
-//             // Display all locations (last 5 for brevity)
-//             String content = locationList.reversed.take(5).join('\n');
-
-//             // use position
-//             service.setForegroundNotificationInfo(
-//               title: "Tracking ${locationList.length} positions",
-//               content: content,
-//             );
-
-//             // You can also send this data to a server or save it
-//             print("Logged: $pos");
-//           } catch (e) {
-//             print("Error getting position: $e");
-//           }
-//         } else {
-//           print("Location permission not granted.");
-//         }
-//       }
-//     }
-//   });
-
-//   if (service is AndroidServiceInstance) {
-//     service.on('setAsForeground').listen((even) {
-//       service.setAsForegroundService();
-//     });
-
-//     service.on('setAsBackground').listen((even) {
-//       service.setAsBackgroundService();
-//     });
-
-//     service.on('pauseTracking').listen((event) {
-//       isTracking = false;
-//       print("Tracking paused.");
-//     });
-
-//     service.on('resumeTracking').listen((event) {
-//       isTracking = true;
-//       print("Tracking resumed.");
-//     });
-//   }
-
-//   service.on('stopService').listen((event) async {
-//     timer.cancel(); // Stop the periodic timer
-//     await prefs.setStringList('location_history', locationList);
-//     service.stopSelf();
-//   });
-// }
-
-
-
-class MyApp extends StatefulWidget {
+// ───────────────────────────────────────────────────────────
+//  UI – just a placeholder
+// ───────────────────────────────────────────────────────────
+class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
   @override
-  State<MyApp> createState() => _MyAppState();
-}
-
-class _MyAppState extends State<MyApp> {
-  String text = "Stop Service";
-
-  @override
-  void initState() {
-    super.initState();
-    _requestLocationPermission();
-    _initializeBGTask();
-  }
-
-  // This widget is the root of your application.
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      home: Scaffold(
-        appBar: AppBar(title: const Text('Service app')),
-        body: Column(
-          children: [
-            ElevatedButton(
-              onPressed: () {
-                FlutterBackgroundService().invoke("setAsForeground");
-              },
-              child: const Text("Foreground Mode"),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                FlutterBackgroundService().invoke("setAsBackground");
-              },
-              child: const Text("Background Mode"),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                FlutterBackgroundService().invoke("pauseTracking");
-              },
-              child: const Text("Pause Tracking"),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                FlutterBackgroundService().invoke("resumeTracking");
-              },
-              child: const Text("Resume Tracking"),
-            ),
-            ElevatedButton(
-              child: Text(text),
-              onPressed: () async {
-                final service = FlutterBackgroundService();
-                var isRunning = await service.isRunning();
-                if (isRunning) {
-                  service.invoke("stopService");
-                } else {
-                  service.startService();
-                }
-                if (!isRunning) {
-                  text = "Stop Service";
-                } else {
-                  text = "Start Service";
-                }
-
-                setState(() {});
-              },
-            ),
-          ],
+  Widget build(BuildContext context) => MaterialApp(
+        home: Scaffold(
+          appBar: AppBar(title: const Text('Background Location Demo')),
+          body: const Center(child: Text('Background task scheduled.')),
         ),
-      ),
-    );
-  }
-
-  Future<void> _requestLocationPermission() async {
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      permission = await Geolocator.requestPermission();
-    }
-
-    bool isLocationServiceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!isLocationServiceEnabled) {
-      // Optionally prompt user to enable location
-      await Geolocator.openLocationSettings();
-    }
-  }
-
-  Future<void> _initializeBGTask() async {
-    var uniqueID = "getLocationIdentifier";
-    await Workmanager().registerPeriodicTask(
-      uniqueID,
-      task,
-      frequency: const Duration(minutes: 15), // Android minimum
-      initialDelay: Duration(seconds: 10),
-      constraints: Constraints(
-        networkType: NetworkType.not_required        
-      ),
-    );
-  }
+      );
 }
-

@@ -38,6 +38,8 @@ dependencies:
   geolocator: ^14.0.2
   shared_preferences: ^2.5.3
   workmanager: ^0.7.0
+  flutter_local_notifications: ^19.3.0
+  permission_handler: ^11.3.0
 
 dev_dependencies:
   flutter_test:
